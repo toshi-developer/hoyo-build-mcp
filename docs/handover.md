@@ -65,7 +65,8 @@ HoYoLAB 戦績は **所持キャラ全件を読めるが Cookie が要り、Cook
 |---|---|
 | スタレ `base_type`（運命） | 所持35体を Enka `hsr/avatars.json` の `AvatarBaseType` と突き合わせ8種すべて一致。うち 6→存護 は Mihomo 出力とも一致 |
 | 原神 `element`（Pyro 系） | 所持46体を Enka `gi/avatars.json` と突き合わせ7属性すべて一致 |
-| ゼンゼロ `element_type` / `avatar_profession` | 所持22体を Enka `zzz/avatars.json` と突き合わせ一致。日本語の公式表記は出典が無いので Enka の英語表記のまま出している |
+| ゼンゼロ `element_type` | 所持22体を Enka `zzz/avatars.json` と突き合わせ一致。日本語は `zzz/locs.json` の ja から取れる（`AddedDamageRatio_Physics` → 物理属性ダメージボーナス 等） |
+| ゼンゼロ `avatar_profession` | 同じく突き合わせ一致。ただし**日本語の出典が無い**（`zzz/locs.json` の ja に該当キーが無い）ので Enka の英語表記のまま出している |
 
 ゼンゼロは `x-rpc-language` を見ず **`x-rpc-lang`** を見る（両方送っている）。これに気づかないと
 名前が英語で返る。

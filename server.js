@@ -448,9 +448,10 @@ const HSR_PATH_BY_ID = { 1: "壊滅", 2: "巡狩", 3: "智識", 4: "調和", 5: 
 // Enka の gi/avatars.json と突き合わせて7属性すべて確認（2026-09-17）。
 const GI_ELEMENT_BY_HOYO = { Pyro: "炎", Hydro: "水", Anemo: "風", Electro: "雷", Dendro: "草", Geo: "岩", Cryo: "氷" };
 
-// ゼンゼロ。HoYoLAB は数値、Enka の zzz/avatars.json は文字列。所持22体で突き合わせて確認
-// （2026-09-17）。日本語の公式表記は出典が取れないため、Enka の表記のまま出す。
-const ZZZ_ELEMENT_BY_ID = { 200: "Physics", 201: "Fire", 202: "Ice", 203: "Elec", 205: "Ether" };
+// ゼンゼロ。HoYoLAB は数値、Enka の zzz/avatars.json は文字列。所持22体で突き合わせて確認（2026-09-17）。
+// 属性の日本語は zzz/locs.json の ja から取れる（AddedDamageRatio_Physics → 物理属性ダメージボーナス 等）。
+// 特性（Attack/Stun…）は ja に該当キーが無く日本語の出典が取れないため、Enka の表記のまま出す。
+const ZZZ_ELEMENT_BY_ID = { 200: "物理", 201: "炎", 202: "氷", 203: "電気", 205: "エーテル" };
 const ZZZ_PROFESSION_BY_ID = { 1: "Attack", 2: "Stun", 3: "Anomaly", 4: "Support", 5: "Defense", 6: "Rupture" };
 
 // 引けない ID は推測で埋めず、識別できる形で出す（giSetLabel と同じ方針）
