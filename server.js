@@ -8,7 +8,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
-import { fetchEnka, normalize } from "./enka.js";
+import { fetchEnka, normalize, hsrRelicSets } from "./enka.js";
 
 const API = "https://api.mihomo.me/sr_info_parsed";
 const LANG = process.env.HSR_LANG || "jp";
@@ -17,52 +17,117 @@ const DATA_DIR = process.env.HSR_DATA_DIR || path.join(os.homedir(), ".hsr-build
 const MIN_FETCH_INTERVAL_MS = 60 * 1000; // 取得しすぎ防止
 
 // ---------- HoYoLAB 戦績（所持キャラ全件） ----------
-// Mihomo はサポートキャラ欄の分しか読めないため、所持キャラ全件は HoYoLAB の
+// Enka / Mihomo はショーケースに並べた分しか読めないため、所持キャラ全件は HoYoLAB の
 // 戦績APIから取る。ログインCookieと DS ヘッダ（公式クライアント由来のソルトで
 // 計算する署名）が要る。ソルトはHoYoLAB側の更新で変わるので環境変数で差し替える。
-const HOYO_HOST = "https://bbs-api-os.hoyolab.com";
-const HOYO_COOKIE = process.env.HOYOLAB_COOKIE || "";
+//
+// ホスト・メソッド・リージョン体系はゲームごとに違う（2026-09-17 に署名の可否を実測）。
+//   スタレ   bbs-api-os    GET  /game_record/hkrpg/api/avatar/basic
+//   原神     bbs-api-os    POST /game_record/genshin/api/character/list
+//   ゼンゼロ sg-public-api GET  /event/game_record_zzz/api/zzz/avatar/basic
+const HOYO_COOKIE_ENV = process.env.HOYOLAB_COOKIE || "";
+const HOYO_COOKIE_FILE = process.env.HOYOLAB_COOKIE_FILE || path.join(DATA_DIR, ".hoyolab-cookie");
 const HOYO_SALT = process.env.HOYOLAB_DS_SALT || "6s25p5ox5y14umn1p61aqyyvbvvl3lrt";
 const HOYO_DS_VARIANT = process.env.HOYOLAB_DS_VARIANT || "v1"; // v1 | v2
 const HOYO_APP_VERSION = process.env.HOYOLAB_APP_VERSION || "1.5.0";
 
-// UIDの先頭桁でサーバーが決まる
-function hoyoRegion(uid) {
-  if (process.env.HSR_REGION) return process.env.HSR_REGION;
-  return { 6: "prod_official_usa", 7: "prod_official_eur", 8: "prod_official_asia", 9: "prod_official_cht" }[uid[0]]
-    || "prod_official_asia";
+// ltoken_v2 はログインセッションそのもの。`claude mcp add -e HOYOLAB_COOKIE=...` は
+// ~/.claude.json とシェル履歴に平文で残るため、ファイルからも読めるようにしておく。
+let hoyoCookieCache;
+async function hoyoCookie() {
+  if (hoyoCookieCache !== undefined) return hoyoCookieCache;
+  if (HOYO_COOKIE_ENV) return (hoyoCookieCache = HOYO_COOKIE_ENV.trim());
+  try {
+    hoyoCookieCache = (await fs.readFile(HOYO_COOKIE_FILE, "utf8")).trim();
+  } catch {
+    hoyoCookieCache = "";
+  }
+  return hoyoCookieCache;
+}
+
+const HOYO_GAMES = {
+  hsr: {
+    host: "https://bbs-api-os.hoyolab.com",
+    regionEnv: "HSR_REGION",
+    region: (uid) => ({ 6: "prod_official_usa", 7: "prod_official_eur", 8: "prod_official_asia", 9: "prod_official_cht" })[uid[0]] || "prod_official_asia",
+    basic: { method: "GET", path: "/game_record/hkrpg/api/avatar/basic" },
+    detail: { method: "GET", path: "/game_record/hkrpg/api/avatar/info", extra: { need_wiki: "false" } },
+  },
+  genshin: {
+    host: "https://bbs-api-os.hoyolab.com",
+    regionEnv: "GENSHIN_REGION",
+    region: (uid) => ({ 6: "os_usa", 7: "os_euro", 8: "os_asia", 9: "os_cht" })[uid[0]] || "os_asia",
+    basic: { method: "POST", path: "/game_record/genshin/api/character/list" },
+    detail: { method: "POST", path: "/game_record/genshin/api/character/detail" },
+  },
+  zzz: {
+    host: "https://sg-public-api.hoyolab.com",
+    regionEnv: "ZZZ_REGION",
+    // ゼンゼロだけ先頭2桁でサーバーが決まる
+    region: (uid) => ({ 10: "prod_gf_us", 13: "prod_gf_jp", 15: "prod_gf_eu", 17: "prod_gf_sg" })[uid.slice(0, 2)] || "prod_gf_jp",
+    basic: { method: "GET", path: "/event/game_record_zzz/api/zzz/avatar/basic" },
+    detail: { method: "GET", path: "/event/game_record_zzz/api/zzz/avatar/info" },
+  },
+};
+
+// UIDの先頭桁でサーバーが決まる。体系はゲームごとに違う。
+function hoyoRegion(game, uid) {
+  const g = HOYO_GAMES[game];
+  if (!g) throw new Error(`HoYoLAB 戦績に未対応のゲームです: ${game}`);
+  return process.env[g.regionEnv] || g.region(String(uid));
 }
 
 const md5 = (s) => crypto.createHash("md5").update(s).digest("hex");
 
-function hoyoDs(query) {
+function hoyoDs(query, body = "") {
   const t = Math.floor(Date.now() / 1000);
   if (HOYO_DS_VARIANT === "v2") {
     const r = String(Math.floor(Math.random() * 100000) + 100000);
-    return `${t},${r},${md5(`salt=${HOYO_SALT}&t=${t}&r=${r}&b=&q=${query}`)}`;
+    return `${t},${r},${md5(`salt=${HOYO_SALT}&t=${t}&r=${r}&b=${body}&q=${query}`)}`;
   }
   const cs = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
   const r = Array.from({ length: 6 }, () => cs[Math.floor(Math.random() * cs.length)]).join("");
   return `${t},${r},${md5(`salt=${HOYO_SALT}&t=${t}&r=${r}`)}`;
 }
 
-async function hoyoGet(endpoint, params) {
-  if (!HOYO_COOKIE) {
-    throw new Error("環境変数 HOYOLAB_COOKIE が未設定です。HoYoLAB にログインした状態の ltuid_v2 と ltoken_v2 を設定してください。");
+// kind は "basic"（一覧）か "detail"（遺物・スキルまで）
+async function hoyoRequest(game, kind, uid, extraParams = {}) {
+  const g = HOYO_GAMES[game];
+  if (!g) throw new Error(`HoYoLAB 戦績に未対応のゲームです: ${game}`);
+  const spec = g[kind];
+  if (!spec) throw new Error(`${GAME_JA[game] ?? game}には ${kind} のエンドポイントがありません。`);
+
+  const cookie = await hoyoCookie();
+  if (!cookie) {
+    throw new Error(
+      `HoYoLAB の Cookie が未設定です。HoYoLAB にログインした状態の ltuid_v2 と ltoken_v2 を、` +
+      `${HOYO_COOKIE_FILE} に 1行（例: ltuid_v2=...; ltoken_v2=...）で保存するか、環境変数 HOYOLAB_COOKIE に設定してください。`
+    );
   }
+
+  const params = { role_id: String(uid), server: hoyoRegion(game, uid), ...(spec.extra ?? {}), ...extraParams };
   const query = Object.keys(params).sort().map((k) => `${k}=${params[k]}`).join("&");
-  const res = await fetch(`${HOYO_HOST}${endpoint}?${query}`, {
+  const post = spec.method === "POST";
+  const body = post ? JSON.stringify(params) : undefined;
+
+  const res = await fetch(post ? `${g.host}${spec.path}` : `${g.host}${spec.path}?${query}`, {
+    method: spec.method,
     headers: {
-      DS: hoyoDs(query),
-      Cookie: HOYO_COOKIE,
+      DS: hoyoDs(post ? "" : query, body ?? ""),
+      Cookie: cookie,
+      ...(post ? { "Content-Type": "application/json" } : {}),
       "x-rpc-app_version": HOYO_APP_VERSION,
       "x-rpc-client_type": "5",
+      // ゼンゼロ(sg-public-api)は x-rpc-language を見ず x-rpc-lang を見る。両方送る。
       "x-rpc-language": "ja-jp",
+      "x-rpc-lang": "ja-jp",
       Referer: "https://act.hoyolab.com/",
       Origin: "https://act.hoyolab.com",
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     },
+    body,
   });
+
   const j = await res.json().catch(() => ({ retcode: -1, message: `HTTP ${res.status}（JSONで応答せず）` }));
   if (j.retcode !== 0) {
     const hint = {
@@ -70,9 +135,10 @@ async function hoyoGet(endpoint, params) {
       "10001": "Cookieが無効か期限切れ。ltoken_v2 を取り直してください。",
       "-10001": "DS署名が通っていません。HOYOLAB_DS_SALT / HOYOLAB_DS_VARIANT / HOYOLAB_APP_VERSION を見直してください。",
       "10102": "戦績が非公開です。HoYoLABの設定で戦績を公開にしてください。",
+      "-1": "リージョン指定が誤っている可能性があります。" + `${g.regionEnv} で上書きできます（現在: ${hoyoRegion(game, uid)}）。`,
       "1034": "HoYoLAB側がbot判定しました。ブラウザでHoYoLABを開いて認証を通してから再試行してください。",
     }[String(j.retcode)] || "";
-    throw new Error(`HoYoLAB APIエラー: retcode=${j.retcode} ${j.message}${hint ? ` / ${hint}` : ""}`);
+    throw new Error(`HoYoLAB APIエラー(${GAME_JA[game] ?? game}): retcode=${j.retcode} ${j.message}${hint ? ` / ${hint}` : ""}`);
   }
   return j.data;
 }
@@ -345,11 +411,7 @@ server.tool(
   async ({ uid, detail = false, raw = false }) => {
     try {
       const u = resolveUid(uid);
-      const endpoint = detail ? "/game_record/hkrpg/api/avatar/info" : "/game_record/hkrpg/api/avatar/basic";
-      const params = { role_id: u, server: hoyoRegion(u) };
-      if (detail) params.need_wiki = "false";
-
-      const data = await hoyoGet(endpoint, params);
+      const data = await hoyoRequest("hsr", detail ? "detail" : "basic", u);
       if (raw) return text(data);
 
       const list = data.avatar_list ?? data.list ?? [];
@@ -360,7 +422,7 @@ server.tool(
 
       return text({
         取得日時: new Date().toISOString(),
-        サーバー: hoyoRegion(u),
+        サーバー: hoyoRegion("hsr", u),
         所持キャラ数: list.length,
         保存先: file,
         キャラ: list.map(summarizeRosterAvatar),
@@ -372,6 +434,255 @@ server.tool(
   }
 );
 
+
+// ---------- HoYoLAB 戦績の整形 ----------
+// HoYoLAB は項目名を自分で返す（原神 property_map / ゼンゼロ property_name /
+// スタレ property_info）ので、Enka のような ID→名前の変換表は要らない。
+// 数値のままなのは下の3つだけ。いずれも公開変換表と実データで裏を取ってから載せている。
+
+// スタレの base_type。所持35体を Enka の hsr/avatars.json（AvatarBaseType）と
+// 突き合わせて8種すべて一致を確認。うち 6→存護 は Mihomo の出力とも一致（2026-09-17）。
+const HSR_PATH_BY_ID = { 1: "壊滅", 2: "巡狩", 3: "智識", 4: "調和", 5: "虚無", 6: "存護", 7: "豊穣", 8: "記憶" };
+
+// 原神。HoYoLAB は Pyro/Hydro 系、Enka は Fire/Water 系で語彙が違う。所持46体を
+// Enka の gi/avatars.json と突き合わせて7属性すべて確認（2026-09-17）。
+const GI_ELEMENT_BY_HOYO = { Pyro: "炎", Hydro: "水", Anemo: "風", Electro: "雷", Dendro: "草", Geo: "岩", Cryo: "氷" };
+
+// ゼンゼロ。HoYoLAB は数値、Enka の zzz/avatars.json は文字列。所持22体で突き合わせて確認
+// （2026-09-17）。日本語の公式表記は出典が取れないため、Enka の表記のまま出す。
+const ZZZ_ELEMENT_BY_ID = { 200: "Physics", 201: "Fire", 202: "Ice", 203: "Elec", 205: "Ether" };
+const ZZZ_PROFESSION_BY_ID = { 1: "Attack", 2: "Stun", 3: "Anomaly", 4: "Support", 5: "Defense", 6: "Rupture" };
+
+// 引けない ID は推測で埋めず、識別できる形で出す（giSetLabel と同じ方針）
+const unknownId = (v) => `(未確認ID:${v})`;
+
+function rosterEntries(game, data) {
+  if (game === "hsr") {
+    return (data.avatar_list ?? []).map((a) => ({
+      _id: a.id,
+      名前: a.name,
+      レア: a.rarity,
+      Lv: a.level,
+      星魂: a.rank ?? 0,
+      属性: ELEMENT_JA[a.element] ?? a.element ?? null,
+      運命: HSR_PATH_BY_ID[a.base_type] ?? unknownId(a.base_type),
+      光円錐: a.equip ? `${a.equip.name} Lv${a.equip.level} 重畳${a.equip.rank}` : "なし",
+    }));
+  }
+  if (game === "genshin") {
+    return (data.list ?? []).map((c) => ({
+      _id: c.id,
+      名前: c.name,
+      レア: c.rarity,
+      Lv: c.level,
+      命ノ星座: c.actived_constellation_num ?? 0,
+      属性: GI_ELEMENT_BY_HOYO[c.element] ?? unknownId(c.element),
+      好感度: c.fetter,
+      武器: c.weapon ? `${c.weapon.name} Lv${c.weapon.level} 精錬${c.weapon.affix_level}` : "なし",
+    }));
+  }
+  return (data.avatar_list ?? []).map((a) => ({
+    _id: a.id,
+    名前: a.name_mi18n,
+    フルネーム: a.full_name_mi18n,
+    レア: a.rarity,
+    Lv: a.level,
+    凸: a.rank ?? 0,
+    属性: ZZZ_ELEMENT_BY_ID[a.element_type] ?? unknownId(a.element_type),
+    特性: ZZZ_PROFESSION_BY_ID[a.avatar_profession] ?? unknownId(a.avatar_profession),
+    陣営: a.camp_name_mi18n,
+  }));
+}
+
+function rosterFile(game, uid) {
+  return path.join(DATA_DIR, "roster", game, `${uid}.json`);
+}
+
+// 所持キャラ一覧。1分以内の再取得は保存済みを返す（HoYoLAB を叩きすぎない）
+async function getRoster(game, uid, { refresh = true } = {}) {
+  const key = `roster:${game}:${uid}`;
+  const file = rosterFile(game, uid);
+  const recent = Date.now() - (lastFetch.get(key) || 0) < MIN_FETCH_INTERVAL_MS;
+  if (!refresh || recent) {
+    try { return await readJson(file); } catch { /* 無ければ取りに行く */ }
+  }
+  const data = await hoyoRequest(game, "basic", uid);
+  lastFetch.set(key, Date.now());
+  const saved = { _fetched_at: new Date().toISOString(), サーバー: hoyoRegion(game, uid), キャラ: rosterEntries(game, data) };
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, JSON.stringify(saved, null, 2));
+  return saved;
+}
+
+function findRosterEntry(roster, name) {
+  const q = norm(name);
+  const cs = roster.キャラ ?? [];
+  return cs.find((c) => norm(c.名前) === q)
+    || cs.find((c) => norm(c.フルネーム ?? "") === q)
+    || cs.find((c) => norm(c.名前).includes(q))
+    || cs.find((c) => norm(c.フルネーム ?? "").includes(q));
+}
+
+// ---------- HoYoLAB の詳細（ショーケースに出していないキャラも読める） ----------
+
+// 「0」「0.0%」のような実質ゼロの表示値か
+const isZeroStat = (v) => /^0(\.0+)?%?$/.test(String(v ?? "").trim());
+// ゼロでも常に出す主要ステータス（見て「無い」と分かることに意味があるもの）
+const GI_CORE_STATS = new Set(["HP上限", "攻撃力", "防御力", "会心率", "会心ダメージ", "元素熟知", "元素チャージ効率"]);
+
+function giHoyoDetail(c, propertyMap) {
+  const pname = (t) => propertyMap?.[String(t)]?.name ?? `(プロパティID:${t})`;
+  // 同じ property_type が base/extra/element に重複して出るのでまとめる
+  const stats = new Map();
+  for (const list of [c.selected_properties, c.base_properties, c.extra_properties, c.element_properties]) {
+    for (const p of list ?? []) if (!stats.has(p.property_type)) stats.set(p.property_type, p);
+  }
+  // セット効果は実際に着けている個数で判定する
+  const counts = new Map();
+  for (const r of c.relics ?? []) if (r.set?.id) counts.set(r.set.id, (counts.get(r.set.id) ?? 0) + 1);
+  const setEffects = [];
+  for (const r of c.relics ?? []) {
+    if (!r.set?.id || setEffects.some((s) => s._id === r.set.id)) continue;
+    const n = counts.get(r.set.id);
+    setEffects.push({
+      _id: r.set.id,
+      セット: `${r.set.name}（${n}個）`,
+      効果: (r.set.affixes ?? []).filter((a) => a.activation_number <= n).map((a) => `${a.activation_number}セット: ${a.effect}`),
+    });
+  }
+  return {
+    名前: c.base?.name,
+    レア: c.base?.rarity,
+    Lv: c.base?.level,
+    命ノ星座: c.base?.actived_constellation_num ?? 0,
+    属性: GI_ELEMENT_BY_HOYO[c.base?.element] ?? unknownId(c.base?.element),
+    好感度: c.base?.fetter,
+    武器: c.weapon
+      ? {
+          名前: c.weapon.name, 種類: c.weapon.type_name, Lv: c.weapon.level, レア: c.weapon.rarity,
+          精錬: c.weapon.affix_level, 突破: c.weapon.promote_level,
+          メイン: c.weapon.main_property ? `${pname(c.weapon.main_property.property_type)} ${c.weapon.main_property.final}` : null,
+          サブ: c.weapon.sub_property ? `${pname(c.weapon.sub_property.property_type)} ${c.weapon.sub_property.final}` : null,
+        }
+      : "なし",
+    // 未強化の元素ダメージ/耐性が 0.0% のまま大量に並ぶので、値のあるものと主要ステータスだけ出す
+    最終ステータス: [...stats.values()]
+      .filter((p) => GI_CORE_STATS.has(pname(p.property_type)) || !isZeroStat(p.final))
+      .map((p) => `${pname(p.property_type)} ${p.final}`),
+    天賦: (c.skills ?? []).map((s) => `${s.name} Lv${s.level}`),
+    命ノ星座詳細: (c.constellations ?? []).map((k) => `${k.pos}凸 ${k.name}${k.is_actived ? "" : "（未解放）"}`),
+    聖遺物: (c.relics ?? []).map((r) => ({
+      部位: r.pos_name, 名前: r.name, セット: r.set?.name, Lv: r.level, レア: r.rarity,
+      メイン: `${pname(r.main_property.property_type)} ${r.main_property.value}`,
+      サブ: (r.sub_property_list ?? []).map((s) => `${pname(s.property_type)} ${s.value}${s.times ? `（強化${s.times}回）` : ""}`),
+    })),
+    セット効果: setEffects.map(({ _id, ...rest }) => rest),
+  };
+}
+
+function zzzHoyoDetail(c) {
+  const prop = (p) => `${p.property_name} ${p.base}`;
+  const suits = new Map();
+  for (const d of c.equip ?? []) if (d.equip_suit?.suit_id) suits.set(d.equip_suit.suit_id, d.equip_suit);
+  return {
+    名前: c.name_mi18n,
+    フルネーム: c.full_name_mi18n,
+    レア: c.rarity,
+    Lv: c.level,
+    凸: c.rank ?? 0,
+    属性: ZZZ_ELEMENT_BY_ID[c.element_type] ?? unknownId(c.element_type),
+    特性: ZZZ_PROFESSION_BY_ID[c.avatar_profession] ?? unknownId(c.avatar_profession),
+    陣営: c.camp_name_mi18n,
+    音動機: c.weapon
+      ? {
+          名前: c.weapon.name, Lv: c.weapon.level, レア: c.weapon.rarity, 重畳: c.weapon.star,
+          メイン: (c.weapon.main_properties ?? []).map(prop),
+          サブ: (c.weapon.properties ?? []).map(prop),
+          効果: c.weapon.talent_title,
+        }
+      : "なし",
+    最終ステータス: (c.properties ?? []).map((p) => `${p.property_name} ${p.final}`),
+    スキル: (c.skills ?? []).map((s) => `${s.items?.[0]?.title ?? `種別${s.skill_type}`} Lv${s.level}`),
+    ドライバディスク: (c.equip ?? []).map((d) => ({
+      名前: d.name, Lv: d.level, レア: d.rarity,
+      メイン: (d.main_properties ?? []).map(prop),
+      サブ: (d.properties ?? []).map((p) => `${p.property_name} ${p.base}${p.level > 1 ? `(+${p.level - 1})` : ""}`),
+    })),
+    セット効果: [...suits.values()].filter((s) => s.own >= 2).map((s) => ({
+      セット: `${s.name}（${s.own}個）`,
+      効果: [s.own >= 2 ? `2セット: ${s.desc1}` : null, s.own >= 4 ? `4セット: ${s.desc2}` : null].filter(Boolean),
+    })),
+    // 1個だけで効果が出ていないディスクも、厳選の余地として見えるようにしておく
+    効果の出ていないセット: [...suits.values()].filter((s) => s.own < 2).map((s) => `${s.name}（${s.own}個）`),
+    凸詳細: (c.ranks ?? []).map((r) => `${r.id}凸 ${r.name}${r.is_unlocked === false ? "（未解放）" : ""}`),
+  };
+}
+
+function hsrHoyoDetail(a, propertyInfo, sets) {
+  const pname = (t) => propertyInfo?.[String(t)]?.name ?? `(プロパティID:${t})`;
+  const setIdOf = (r) => sets?.setIdOf(r.id) ?? null;
+  const relic = (r) => ({
+    名前: r.name,
+    セット: (setIdOf(r) && sets.setName(setIdOf(r))) || (setIdOf(r) ? `(未収録セットID:${setIdOf(r)})` : null),
+    Lv: r.level, レア: r.rarity,
+    メイン: `${pname(r.main_property.property_type)} ${r.main_property.value}`,
+    サブ: (r.properties ?? []).map((s) => `${pname(s.property_type)} ${s.value}${s.times ? `（強化${s.times}回）` : ""}`),
+  });
+  // 遺物とオーナメントをセットIDでまとめて、実際に着けている個数で効果を出す
+  const counts = new Map();
+  for (const r of [...(a.relics ?? []), ...(a.ornaments ?? [])]) {
+    const id = setIdOf(r);
+    if (id) counts.set(id, (counts.get(id) ?? 0) + 1);
+  }
+  const setEffects = [...counts.entries()].map(([id, n]) => ({
+    セット: `${sets.setName(id) ?? `(未収録セットID:${id})`}（${n}個）`,
+    効果: sets.setProps(id, n),
+  }));
+  return {
+    名前: a.name,
+    レア: a.rarity,
+    Lv: a.level,
+    星魂: a.rank ?? 0,
+    属性: ELEMENT_JA[a.element] ?? a.element ?? null,
+    運命: HSR_PATH_BY_ID[a.base_type] ?? unknownId(a.base_type),
+    光円錐: a.equip ? { 名前: a.equip.name, Lv: a.equip.level, 重畳: a.equip.rank, レア: a.equip.rarity } : "なし",
+    最終ステータス: (a.properties ?? []).map((p) => `${pname(p.property_type)} ${p.final}`),
+    軌跡: (a.skills ?? []).filter((s) => s.point_type === 2)
+      .map((s) => `${s.remake}: ${s.skill_stages?.[0]?.name ?? ""} Lv${s.level}`.replace("  ", " ")),
+    追加能力: (a.skills ?? []).filter((s) => s.point_type === 3)
+      .map((s) => `${s.skill_stages?.[0]?.name ?? s.remake}${s.is_activated ? "" : "（未解放）"}`),
+    ステータスボーナス解放数: (a.skills ?? []).filter((s) => s.point_type === 1 && s.is_activated).length,
+    遺物: (a.relics ?? []).map(relic),
+    オーナメント: (a.ornaments ?? []).map(relic),
+    セット効果: setEffects,
+    星魂詳細: (a.ranks ?? []).map((r) => `${r.pos}凸 ${String(r.name).replace(/\n/g, "")}${r.is_unlocked ? "" : "（未解放）"}`),
+  };
+}
+
+// 名前からキャラを引いて、HoYoLAB の詳細を整形して返す。見つからなければ null。
+async function hoyoCharacterDetail(game, uid, name) {
+  const roster = await getRoster(game, uid, { refresh: false });
+  const entry = findRosterEntry(roster, name);
+  if (!entry) return { found: false, roster };
+
+  if (game === "genshin") {
+    const d = await hoyoRequest("genshin", "detail", uid, { character_ids: [entry._id] });
+    const c = (d.list ?? [])[0];
+    if (!c) return { found: false, roster };
+    return { found: true, roster, detail: giHoyoDetail(c, d.property_map) };
+  }
+  if (game === "zzz") {
+    const d = await hoyoRequest("zzz", "detail", uid, { "id_list[]": entry._id, need_wiki: "false" });
+    const c = (d.avatar_list ?? [])[0];
+    if (!c) return { found: false, roster };
+    return { found: true, roster, detail: zzzHoyoDetail(c) };
+  }
+  // スタレは1回のリクエストで全員分（1MB超）返るので、該当キャラだけ取り出す
+  const d = await hoyoRequest("hsr", "detail", uid);
+  const a = (d.avatar_list ?? []).find((x) => x.id === entry._id);
+  if (!a) return { found: false, roster };
+  return { found: true, roster, detail: hsrHoyoDetail(a, d.property_info, await hsrRelicSets(DATA_DIR)) };
+}
 
 // ---------- 原神 / ゼンレスゾーンゼロ（Enka.Network） ----------
 // スタレは Mihomo の parsed API のほうが整形済みなので、そちらを使い続ける。
@@ -484,35 +795,94 @@ server.tool(
 
 server.tool(
   "build_get_character",
-  "指定キャラの育成状況を詳しく返す（最終ステータス、天賦/スキルLv、武器・音動機・光円錐、聖遺物/ディスク/遺物のメイン・サブステ）。",
+  "指定キャラの育成状況を詳しく返す（最終ステータス、天賦/スキルLv、武器・音動機・光円錐、聖遺物/ディスク/遺物のメイン・サブステ、セット効果）。ショーケースに並べていないキャラも HoYoLAB 戦績から読める。",
   {
     game: z.enum(["genshin", "zzz", "hsr"]),
     name: z.string().describe("キャラ名（部分一致可）"),
     uid: z.string().optional(),
-    refresh: z.boolean().optional().describe("APIから再取得するか（既定: false）"),
+    refresh: z.boolean().optional().describe("ショーケース側をAPIから再取得するか（既定: false）"),
+    source: z.enum(["auto", "showcase", "hoyolab"]).optional()
+      .describe("auto=ショーケースを見て、居なければ HoYoLAB 戦績にフォールバック（既定） / showcase=Enka・Mihomoのみ / hoyolab=HoYoLAB戦績のみ"),
   },
-  async ({ game, name, uid, refresh = false }) => {
+  async ({ game, name, uid, refresh = false, source = "auto" }) => {
     try {
       const u = resolveGameUid(game, uid);
-      if (game === "hsr") {
-        const { data } = await getLatest(u, { refresh });
-        const c = findCharacter(data, name);
-        if (!c) return fail(new Error(`「${name}」が見つかりません。表示中: ${(data.characters ?? []).map((x) => x.name).join("、")}`));
-        return text({ ゲーム: GAME_JA.hsr, 取得日時: data._fetched_at, ...detailCharacter(c) });
+
+      const fromHoyolab = async (label) => {
+        const r = await hoyoCharacterDetail(game, u, name);
+        if (!r.found) {
+          const owned = (r.roster?.キャラ ?? []).map((c) => c.名前).join("、");
+          throw new Error(`「${name}」が所持キャラに見つかりません。所持: ${owned || "（取得できず）"}`);
+        }
+        return text({ ゲーム: GAME_JA[game], 出典: label, 取得日時: r.roster._fetched_at, ...r.detail });
+      };
+
+      if (source === "hoyolab") return await fromHoyolab("HoYoLAB 戦績");
+
+      // ショーケース（従来どおりの経路）
+      let showcaseErr = null;
+      try {
+        if (game === "hsr") {
+          const { data } = await getLatest(u, { refresh });
+          const c = findCharacter(data, name);
+          if (c) return text({ ゲーム: GAME_JA.hsr, 出典: "Mihomo（ショーケース）", 取得日時: data._fetched_at, ...detailCharacter(c) });
+        } else {
+          const { data } = await enkaLatest(game, u, { refresh });
+          const c = enkaFindCharacter(data, name);
+          if (c) {
+            const base = stripInternal(c);
+            return text(
+              game === "genshin"
+                ? { ゲーム: GAME_JA.genshin, 出典: "Enka.Network（ショーケース）", 取得日時: data._fetched_at, ...base,
+                    最終ステータス: c._stats, 天賦: c._talents, 武器詳細: c._weapon, 聖遺物: c._artifacts }
+                : { ゲーム: GAME_JA.zzz, 出典: "Enka.Network（ショーケース）", 取得日時: data._fetched_at, ...base,
+                    スキル: c._skills, 音動機詳細: c._weapon, ドライバディスク: c._discs }
+            );
+          }
+        }
+      } catch (e) {
+        if (source === "showcase") throw e;
+        showcaseErr = e; // auto なら HoYoLAB を試す
       }
-      const { data } = await enkaLatest(game, u, { refresh });
-      const c = enkaFindCharacter(data, name);
-      if (!c) return fail(new Error(`「${name}」が見つかりません。表示中: ${(data.characters ?? []).map((x) => x.名前).join("、")}`));
-      const base = stripInternal(c);
-      if (game === "genshin") {
-        return text({
-          ゲーム: GAME_JA.genshin, 取得日時: data._fetched_at, ...base,
-          最終ステータス: c._stats, 天賦: c._talents, 武器詳細: c._weapon, 聖遺物: c._artifacts,
-        });
+
+      if (source === "showcase") {
+        return fail(new Error(`「${name}」がショーケースに見つかりません。ショーケース外のキャラは source を省略（auto）するか hoyolab にしてください。`));
       }
+
+      const res = await fromHoyolab("HoYoLAB 戦績（ショーケース外）");
+      if (showcaseErr) {
+        const o = JSON.parse(res.content[0].text);
+        return text({ ...o, ショーケース側のエラー: showcaseErr.message });
+      }
+      return res;
+    } catch (e) {
+      return fail(e);
+    }
+  }
+);
+
+server.tool(
+  "build_fetch_roster",
+  "HoYoLAB の戦績から所持キャラを全件取得する（ショーケースに並べていないキャラも含む）。編成を考えるときはまずこれ。要 HoYoLAB Cookie。",
+  {
+    game: z.enum(["genshin", "zzz", "hsr"]).describe("genshin=原神 / zzz=ゼンゼロ / hsr=スタレ"),
+    uid: z.string().optional().describe("省略時は環境変数（GENSHIN_UID / ZZZ_UID / HSR_UID）"),
+    refresh: z.boolean().optional().describe("APIから再取得するか（既定: true。1分以内の再取得は保存済みを返す）"),
+    raw: z.boolean().optional().describe("APIの生レスポンスをそのまま返す（応答形式の確認用）"),
+  },
+  async ({ game, uid, refresh = true, raw = false }) => {
+    try {
+      const u = resolveGameUid(game, uid);
+      if (raw) return text(await hoyoRequest(game, "basic", u));
+      const roster = await getRoster(game, u, { refresh });
       return text({
-        ゲーム: GAME_JA.zzz, 取得日時: data._fetched_at, ...base,
-        スキル: c._skills, 音動機詳細: c._weapon, ドライバディスク: c._discs,
+        ゲーム: GAME_JA[game],
+        取得日時: roster._fetched_at,
+        サーバー: roster.サーバー,
+        出典: "HoYoLAB 戦績",
+        所持キャラ数: (roster.キャラ ?? []).length,
+        キャラ: (roster.キャラ ?? []).map(stripInternal),
+        注意: "育成状況の詳細は build_get_character で1キャラずつ取得してください。",
       });
     } catch (e) {
       return fail(e);

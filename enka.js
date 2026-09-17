@@ -333,3 +333,30 @@ export async function normalize(game, raw, dataDir) {
   if (game === "zzz") return normalizeZZZ(raw, dataDir);
   throw new Error(`未対応のゲームです: ${game}`);
 }
+
+// ---------- スタレの遺物セット（HoYoLAB 戦績の整形に使う） ----------
+// HoYoLAB は遺物の「部位名」は返すがセット名を返さない。Enka の公開表で解決する。
+// hsr/relics.json の Items が 遺物ID→SetID、Sets が SetID→名前ハッシュ＋セット効果。
+// 名前ハッシュは hsr/hsr.json の ja で引く。名前が引けないセットは推測で埋めない。
+export async function hsrRelicSets(dataDir) {
+  const [relics, loc] = await Promise.all([asset(dataDir, "hsr/relics.json"), asset(dataDir, "hsr/hsr.json")]);
+  const ja = { ...(loc.en ?? {}), ...(loc.ja ?? {}) };
+  const items = relics.Items ?? {};
+  const sets = relics.Sets ?? {};
+  return {
+    setIdOf: (relicId) => items[String(relicId)]?.SetID ?? null,
+    setName: (setId) => ja[String(sets[String(setId)]?.Name)] ?? null,
+    // セット効果は props から機械的に導く（2セット/4セットの判定込み）
+    setProps: (setId, count) => {
+      const skills = sets[String(setId)]?.SetSkills ?? {};
+      const out = [];
+      for (const n of Object.keys(skills).map(Number).sort((a, b) => a - b)) {
+        if (n > count) continue;
+        const props = skills[String(n)]?.props ?? {};
+        const body = Object.entries(props).map(([k, v]) => `${k} ${v > 0 && v < 1 ? `${(v * 100).toFixed(1)}%` : v}`).join(" / ");
+        out.push(`${n}セット${body ? `: ${body}` : "（効果は数値化されていません）"}`);
+      }
+      return out;
+    },
+  };
+}
