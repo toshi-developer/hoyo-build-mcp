@@ -65,7 +65,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 npm install
 claude mcp add game-build -s user \
   -e HSR_UID=<スタレUID> -e GENSHIN_UID=<原神UID> -e ZZZ_UID=<ゼンゼロUID> \
-  -- node /home/toshi/workspace/projects/private-tools/game-build-mcp/server.js
+  -- node /絶対パス/game-build-mcp/server.js
 ```
 
 `~/.hsr-build-mcp/` は履歴と変換表の保存先で、リポジトリ外。`HSR_DATA_DIR` で変えられる。

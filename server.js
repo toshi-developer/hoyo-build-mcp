@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// 崩壊：スターレイル 育成相談用 MCPサーバー
-// データ元: Mihomo API（非公式）。ゲーム内「サポートキャラ」欄に表示中のキャラのみ取得可能。
+// 原神・ゼンレスゾーンゼロ・崩壊：スターレイル 育成相談用 MCPサーバー
+// データ元は2系統。ショーケース（Enka.Network / Mihomo、Cookie不要だが並べた分のみ）と
+// HoYoLAB 戦績（所持キャラ全件、要Cookie）。いずれも非公式APIで読み取りのみ。
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -174,7 +175,7 @@ function resolveUid(uid) {
 
 async function fetchFromApi(uid) {
   const res = await fetch(`${API}/${uid}?lang=${LANG}`, {
-    headers: { "User-Agent": "hsr-build-mcp/1.0 (personal use)" },
+    headers: { "User-Agent": "game-build-mcp/1.1 (+https://github.com/toshi-developer/game-build-mcp)" },
   });
   if (!res.ok) {
     const hint =
@@ -307,7 +308,7 @@ const fail = (e) => ({ isError: true, content: [{ type: "text", text: `エラー
 
 // ---------- MCPサーバー ----------
 
-const server = new McpServer({ name: "hsr-build", version: "1.0.0" });
+const server = new McpServer({ name: "game-build", version: "1.1.0" });
 
 server.tool(
   "hsr_fetch_showcase",

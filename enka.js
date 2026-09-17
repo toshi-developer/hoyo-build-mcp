@@ -6,7 +6,7 @@ import path from "node:path";
 
 const ENKA = "https://enka.network/api";
 const ASSET = "https://raw.githubusercontent.com/EnkaNetwork/API-docs/master/store";
-const UA = "enka-build-mcp/1.0 (personal use; toshidev)";
+const UA = "game-build-mcp/1.1 (+https://github.com/toshi-developer/game-build-mcp)";
 const ASSET_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 export const GAMES = {

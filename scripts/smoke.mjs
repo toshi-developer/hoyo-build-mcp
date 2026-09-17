@@ -1,58 +1,121 @@
 // 実データを使った疎通確認。MCP を再登録せず stdio で直接叩く。
-//   node scripts/smoke.mjs
-// ネットワークと HoYoLAB Cookie（~/.hsr-build-mcp/.hoyolab-cookie）が要る。
-// 件数の期待値は開発者のアカウント（原神46 / ゼンゼロ22 / スタレ35）に合わせてあるので、
-// 別アカウントで動かすときは EXPECT を書き換える。
+//
+//   GENSHIN_UID=... ZZZ_UID=... HSR_UID=... npm run smoke
+//
+// 設定されている UID のぶんだけ確認する。ネットワークが要る。
+// HoYoLAB の Cookie（~/.hsr-build-mcp/.hoyolab-cookie）があれば所持キャラ全件の
+// 確認まで、無ければショーケースのぶんだけ確認して残りはスキップする。
 import { spawn } from "node:child_process";
-const srv = spawn("node", ["server.js"], {
-  cwd: new URL("..", import.meta.url).pathname,
-  env: { ...process.env, HSR_UID: "831028584", GENSHIN_UID: "823801622", ZZZ_UID: "1313237095" },
-  stdio: ["pipe", "pipe", "inherit"],
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+
+const ROOT = new URL("..", import.meta.url).pathname;
+const UID = { genshin: process.env.GENSHIN_UID, zzz: process.env.ZZZ_UID, hsr: process.env.HSR_UID };
+const GAMES = Object.keys(UID).filter((g) => UID[g]);
+if (!GAMES.length) {
+  console.error("GENSHIN_UID / ZZZ_UID / HSR_UID のいずれも設定されていません。");
+  process.exit(2);
+}
+const dataDir = process.env.HSR_DATA_DIR || path.join(os.homedir(), ".hsr-build-mcp");
+const hasCookie = !!process.env.HOYOLAB_COOKIE
+  || fs.existsSync(process.env.HOYOLAB_COOKIE_FILE || path.join(dataDir, ".hoyolab-cookie"));
+
+const srv = spawn("node", ["server.js"], { cwd: ROOT, env: process.env, stdio: ["pipe", "pipe", "inherit"] });
+let buf = "", id = 0;
+const waiting = new Map();
+srv.stdout.on("data", (d) => {
+  buf += d;
+  let i;
+  while ((i = buf.indexOf("\n")) >= 0) {
+    const line = buf.slice(0, i); buf = buf.slice(i + 1);
+    if (!line.trim()) continue;
+    const m = JSON.parse(line);
+    if (waiting.has(m.id)) { waiting.get(m.id)(m); waiting.delete(m.id); }
+  }
 });
-let buf = "", id = 0; const waiting = new Map();
-srv.stdout.on("data", (d) => { buf += d; let i;
-  while ((i = buf.indexOf("\n")) >= 0) { const l = buf.slice(0, i); buf = buf.slice(i + 1);
-    if (!l.trim()) continue; const m = JSON.parse(l);
-    if (waiting.has(m.id)) { waiting.get(m.id)(m); waiting.delete(m.id); } } });
-const send = (method, params) => new Promise((r) => { const n = ++id; waiting.set(n, r);
-  srv.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: n, method, params }) + "\n"); });
-await send("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "1" } });
+const send = (method, params) => new Promise((res) => {
+  const n = ++id; waiting.set(n, res);
+  srv.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: n, method, params }) + "\n");
+});
+
+await send("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "smoke", version: "1" } });
 srv.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
 
-const cases = [
-  ["既存: hsr_fetch_showcase", "hsr_fetch_showcase", { refresh: false }, (j) => j.キャラ?.length >= 1],
-  ["既存: hsr_get_character_build", "hsr_get_character_build", { name: "三月なのか" }, (j) => j.名前 === "三月なのか"],
-  ["既存: hsr_fetch_roster", "hsr_fetch_roster", {}, (j) => j.所持キャラ数 === 35],
-  ["既存: showcase hsr", "build_fetch_showcase", { game: "hsr", refresh: false }, (j) => j.キャラ?.length >= 1],
-  ["既存: showcase genshin", "build_fetch_showcase", { game: "genshin", refresh: false }, (j) => j.キャラ?.length === 4],
-  ["既存: showcase zzz", "build_fetch_showcase", { game: "zzz", refresh: false }, (j) => j.キャラ?.length === 6],
-  ["新: roster hsr", "build_fetch_roster", { game: "hsr" }, (j) => j.所持キャラ数 === 35],
-  ["新: roster genshin", "build_fetch_roster", { game: "genshin" }, (j) => j.所持キャラ数 === 46],
-  ["新: roster zzz", "build_fetch_roster", { game: "zzz" }, (j) => j.所持キャラ数 === 22],
-  ["auto→ショーケース hsr", "build_get_character", { game: "hsr", name: "三月なのか" }, (j) => j.出典.includes("Mihomo")],
-  ["auto→ショーケース genshin", "build_get_character", { game: "genshin", name: "ベネット" }, (j) => j.出典.includes("Enka")],
-  ["auto→ショーケース zzz", "build_get_character", { game: "zzz", name: "星見雅" }, (j) => j.出典.includes("Enka")],
-  ["auto→HoYoLAB hsr", "build_get_character", { game: "hsr", name: "黄泉" }, (j) => j.出典.includes("HoYoLAB") && j.セット効果?.length],
-  ["auto→HoYoLAB genshin", "build_get_character", { game: "genshin", name: "楓原万葉" }, (j) => j.出典.includes("HoYoLAB") && j.聖遺物?.length === 5],
-  ["auto→HoYoLAB zzz", "build_get_character", { game: "zzz", name: "浮波柚葉" }, (j) => j.出典.includes("HoYoLAB") && j.ドライバディスク?.length === 6],
-  ["source=hoyolab でショーケース内も引ける", "build_get_character", { game: "hsr", name: "三月なのか", source: "hoyolab" }, (j) => j.出典 === "HoYoLAB 戦績"],
-  ["部分一致", "build_get_character", { game: "genshin", name: "万葉" }, (j) => j.名前 === "楓原万葉"],
-  ["compare_history 既存", "build_compare_history", { game: "genshin", name: "ベネット" }, () => true],
-];
-let ng = 0;
-for (const [label, name, args, check] of cases) {
+let ng = 0, skip = 0;
+async function check(label, name, args, verify) {
   const r = await send("tools/call", { name, arguments: args });
   const body = r.result?.content?.[0]?.text ?? "";
   let ok = false, note = "";
-  try { const j = JSON.parse(body); ok = !r.result?.isError && !!check(j); if (!ok) note = body.slice(0, 120); }
-  catch { ok = !r.result?.isError && check === undefined; note = body.slice(0, 120); if (label.includes("compare")) ok = true; }
+  try {
+    const j = JSON.parse(body);
+    ok = !r.result?.isError && verify(j) !== false;
+    if (!ok) note = body.slice(0, 160);
+  } catch {
+    ok = !r.result?.isError;
+    if (!ok) note = body.slice(0, 160);
+  }
   if (!ok) ng++;
-  console.log(`${ok ? "OK  " : "NG  "} ${label}${note && !ok ? `\n      ${note}` : ""}`);
+  console.log(`${ok ? "OK  " : "NG  "} ${label}${ok ? "" : `\n      ${note}`}`);
 }
-// エラー系: ショーケース外を source=showcase で引くと落ちること
-const r = await send("tools/call", { name: "build_get_character", arguments: { game: "hsr", name: "黄泉", source: "showcase" } });
-console.log(`${r.result?.isError ? "OK  " : "NG  "} source=showcase はショーケース外を拒否する`);
-if (!r.result?.isError) ng++;
-console.log(`\n失敗: ${ng} 件`);
+// エラーが返ることを期待するチェック
+async function checkFails(label, name, args) {
+  const r = await send("tools/call", { name, arguments: args });
+  const ok = !!r.result?.isError;
+  if (!ok) ng++;
+  console.log(`${ok ? "OK  " : "NG  "} ${label}${ok ? "" : "\n      エラーになるはずが成功した"}`);
+}
+const skipped = (label, why) => { skip++; console.log(`--  ${label}（${why}）`); };
+
+// ツールが揃っているか
+{
+  const t = await send("tools/list", {});
+  const names = t.result.tools.map((x) => x.name);
+  const want = ["build_fetch_showcase", "build_get_character", "build_fetch_roster", "build_compare_history"];
+  const missing = want.filter((w) => !names.includes(w));
+  console.log(`${missing.length ? "NG  " : "OK  "} ツール定義（${names.length}本）${missing.length ? ` 不足: ${missing}` : ""}`);
+  if (missing.length) ng++;
+}
+
+for (const game of GAMES) {
+  // ショーケース（Cookie 不要）
+  let showcased = [];
+  await check(`${game}: ショーケース取得`, "build_fetch_showcase", { game, refresh: false }, (j) => {
+    showcased = (j.キャラ ?? []).map((c) => c.名前 ?? c.名前);
+    console.log(`      → ${showcased.length} 体: ${showcased.slice(0, 4).join("、")}${showcased.length > 4 ? " ほか" : ""}`);
+    return Array.isArray(j.キャラ);
+  });
+  if (showcased[0]) {
+    await check(`${game}: ショーケースのキャラ詳細`, "build_get_character",
+      { game, name: showcased[0], source: "showcase" }, (j) => !!j.出典);
+  } else {
+    skipped(`${game}: ショーケースのキャラ詳細`, "ショーケースが空");
+  }
+
+  // HoYoLAB 戦績（Cookie 必要）
+  if (!hasCookie) { skipped(`${game}: 所持キャラ全件`, "Cookie 未設定"); continue; }
+
+  let owned = [];
+  await check(`${game}: 所持キャラ全件`, "build_fetch_roster", { game }, (j) => {
+    owned = (j.キャラ ?? []).map((c) => c.名前);
+    console.log(`      → ${j.所持キャラ数} 体（サーバー ${j.サーバー}）`);
+    const unresolved = JSON.stringify(j.キャラ ?? []).match(/未確認ID/g);
+    if (unresolved) { console.log(`      ! 未解決IDが ${unresolved.length} 件`); return false; }
+    return owned.length > 0;
+  });
+
+  // ショーケースに出していないキャラを HoYoLAB から引けるか
+  const outside = owned.find((n) => !showcased.includes(n));
+  if (outside) {
+    await check(`${game}: ショーケース外のキャラ詳細（${outside}）`, "build_get_character",
+      { game, name: outside }, (j) => String(j.出典 ?? "").includes("HoYoLAB"));
+    await checkFails(`${game}: source=showcase はショーケース外を拒否する`, "build_get_character",
+      { game, name: outside, source: "showcase" });
+  } else {
+    skipped(`${game}: ショーケース外のキャラ詳細`, "全員ショーケースに出ている");
+  }
+}
+
+console.log(`\n失敗 ${ng} 件 / スキップ ${skip} 件`);
 srv.kill();
 process.exit(ng ? 1 : 0);
