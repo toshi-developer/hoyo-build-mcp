@@ -1,4 +1,4 @@
-# game-build-mcp
+# hoyo-build-mcp
 
 原神・ゼンレスゾーンゼロ・崩壊：スターレイルの育成状況を Claude に読ませる MCP サーバーです。
 「この聖遺物どう？」「次は誰を育てるべき？」を、実際の手持ちデータを見ながら相談できます。
@@ -60,11 +60,11 @@ Enka は ID しか返さないため、公開されている変換表（`store/*
 Node.js 18 以上が要ります。
 
 ```bash
-git clone https://github.com/toshi-developer/game-build-mcp.git
-cd game-build-mcp
+git clone https://github.com/toshi-developer/hoyo-build-mcp.git
+cd hoyo-build-mcp
 npm install
 
-claude mcp add game-build -s user \
+claude mcp add hoyo-build -s user \
   -e GENSHIN_UID=<原神UID> \
   -e ZZZ_UID=<ゼンゼロUID> \
   -e HSR_UID=<スタレUID> \

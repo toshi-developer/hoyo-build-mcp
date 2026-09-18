@@ -175,7 +175,7 @@ function resolveUid(uid) {
 
 async function fetchFromApi(uid) {
   const res = await fetch(`${API}/${uid}?lang=${LANG}`, {
-    headers: { "User-Agent": "game-build-mcp/1.1 (+https://github.com/toshi-developer/game-build-mcp)" },
+    headers: { "User-Agent": "hoyo-build-mcp/1.1 (+https://github.com/toshi-developer/hoyo-build-mcp)" },
   });
   if (!res.ok) {
     const hint =
@@ -308,7 +308,7 @@ const fail = (e) => ({ isError: true, content: [{ type: "text", text: `エラー
 
 // ---------- MCPサーバー ----------
 
-const server = new McpServer({ name: "game-build", version: "1.1.0" });
+const server = new McpServer({ name: "hoyo-build", version: "1.1.0" });
 
 server.tool(
   "hsr_fetch_showcase",
