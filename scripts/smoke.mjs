@@ -43,17 +43,31 @@ await send("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clie
 srv.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
 
 let ng = 0, skip = 0;
+// 失敗は必ず失敗として数える。JSON-RPC の error 応答、result 欠落、JSON 解析失敗、
+// verify() の例外はいずれも「成功」にしない。
 async function check(label, name, args, verify) {
   const r = await send("tools/call", { name, arguments: args });
-  const body = r.result?.content?.[0]?.text ?? "";
   let ok = false, note = "";
-  try {
-    const j = JSON.parse(body);
-    ok = !r.result?.isError && verify(j) !== false;
-    if (!ok) note = body.slice(0, 160);
-  } catch {
-    ok = !r.result?.isError;
-    if (!ok) note = body.slice(0, 160);
+  if (r.error) {
+    note = `JSON-RPC エラー: ${r.error.message ?? JSON.stringify(r.error)}`;
+  } else if (!r.result) {
+    note = "応答に result がありません";
+  } else if (r.result.isError) {
+    note = r.result.content?.[0]?.text?.slice(0, 160) ?? "ツールがエラーを返しました";
+  } else {
+    const body = r.result.content?.[0]?.text ?? "";
+    let parsed, parseErr = null;
+    try { parsed = JSON.parse(body); } catch (e) { parseErr = e; }
+    if (parseErr) {
+      note = `JSON として読めません: ${body.slice(0, 120)}`;
+    } else {
+      try {
+        ok = verify(parsed) !== false;
+        if (!ok) note = body.slice(0, 160);
+      } catch (e) {
+        note = `検証中に例外: ${e.message}`;
+      }
+    }
   }
   if (!ok) ng++;
   console.log(`${ok ? "OK  " : "NG  "} ${label}${ok ? "" : `\n      ${note}`}`);
@@ -61,7 +75,7 @@ async function check(label, name, args, verify) {
 // エラーが返ることを期待するチェック
 async function checkFails(label, name, args) {
   const r = await send("tools/call", { name, arguments: args });
-  const ok = !!r.result?.isError;
+  const ok = !!r.error || !!r.result?.isError;
   if (!ok) ng++;
   console.log(`${ok ? "OK  " : "NG  "} ${label}${ok ? "" : "\n      エラーになるはずが成功した"}`);
 }

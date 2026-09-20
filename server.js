@@ -34,16 +34,22 @@ const HOYO_APP_VERSION = process.env.HOYOLAB_APP_VERSION || "1.5.0";
 
 // ltoken_v2 はログインセッションそのもの。`claude mcp add -e HOYOLAB_COOKIE=...` は
 // ~/.claude.json とシェル履歴に平文で残るため、ファイルからも読めるようにしておく。
-let hoyoCookieCache;
+// Cookie は期限切れで取り直すことがある。内容を覚えっぱなしにすると、置き直しても
+// プロセスを再起動するまで反映されない。mtime を見て変わっていたら読み直す。
+let hoyoCookieCache = { mtime: -1, value: "" };
 async function hoyoCookie() {
-  if (hoyoCookieCache !== undefined) return hoyoCookieCache;
-  if (HOYO_COOKIE_ENV) return (hoyoCookieCache = HOYO_COOKIE_ENV.trim());
+  if (HOYO_COOKIE_ENV) return HOYO_COOKIE_ENV.trim();
   try {
-    hoyoCookieCache = (await fs.readFile(HOYO_COOKIE_FILE, "utf8")).trim();
+    const { mtimeMs } = await fs.stat(HOYO_COOKIE_FILE);
+    if (mtimeMs !== hoyoCookieCache.mtime) {
+      hoyoCookieCache = { mtime: mtimeMs, value: (await fs.readFile(HOYO_COOKIE_FILE, "utf8")).trim() };
+    }
+    return hoyoCookieCache.value;
   } catch {
-    hoyoCookieCache = "";
+    // 未作成なら覚えない。あとから作れば次の呼び出しで拾える。
+    hoyoCookieCache = { mtime: -1, value: "" };
+    return "";
   }
-  return hoyoCookieCache;
 }
 
 const HOYO_GAMES = {
@@ -89,6 +95,18 @@ function hoyoDs(query, body = "") {
   const cs = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
   const r = Array.from({ length: 6 }, () => cs[Math.floor(Math.random() * cs.length)]).join("");
   return `${t},${r},${md5(`salt=${HOYO_SALT}&t=${t}&r=${r}`)}`;
+}
+
+// HoYoLAB の応答を取得間隔ぶんだけ使い回す。特にスタレの詳細は1リクエストで
+// 全員分（実測1.35MB）返るので、別キャラを順に見るだけで毎回取り直すと重い。
+const hoyoCache = new Map(); // キー -> { at, data }
+async function hoyoCached(game, kind, uid, extraParams = {}, cacheKey = "") {
+  const k = `${game}:${kind}:${uid}:${cacheKey}`;
+  const hit = hoyoCache.get(k);
+  if (hit && Date.now() - hit.at < MIN_FETCH_INTERVAL_MS) return hit.data;
+  const data = await hoyoRequest(game, kind, uid, extraParams);
+  hoyoCache.set(k, { at: Date.now(), data });
+  return data;
 }
 
 // kind は "basic"（一覧）か "detail"（遺物・スキルまで）
@@ -412,7 +430,7 @@ server.tool(
   async ({ uid, detail = false, raw = false }) => {
     try {
       const u = resolveUid(uid);
-      const data = await hoyoRequest("hsr", detail ? "detail" : "basic", u);
+      const data = await hoyoCached("hsr", detail ? "detail" : "basic", u);
       if (raw) return text(data);
 
       const list = data.avatar_list ?? data.list ?? [];
@@ -508,7 +526,7 @@ async function getRoster(game, uid, { refresh = true } = {}) {
   if (!refresh || recent) {
     try { return await readJson(file); } catch { /* 無ければ取りに行く */ }
   }
-  const data = await hoyoRequest(game, "basic", uid);
+  const data = await hoyoCached(game, "basic", uid);
   lastFetch.set(key, Date.now());
   const saved = { _fetched_at: new Date().toISOString(), サーバー: hoyoRegion(game, uid), キャラ: rosterEntries(game, data) };
   await fs.mkdir(path.dirname(file), { recursive: true });
@@ -663,27 +681,39 @@ function hsrHoyoDetail(a, propertyInfo, sets) {
 
 // 名前からキャラを引いて、HoYoLAB の詳細を整形して返す。見つからなければ null。
 async function hoyoCharacterDetail(game, uid, name) {
-  const roster = await getRoster(game, uid, { refresh: false });
-  const entry = findRosterEntry(roster, name);
+  let roster = await getRoster(game, uid, { refresh: false });
+  let entry = findRosterEntry(roster, name);
+
+  // 新しく入手したキャラは保存済みの一覧に載っていない。取得間隔を守って取り直す。
+  if (!entry) {
+    const fresh = await getRoster(game, uid, { refresh: true });
+    if (fresh._fetched_at !== roster._fetched_at) {
+      roster = fresh;
+      entry = findRosterEntry(roster, name);
+    }
+  }
   if (!entry) return { found: false, roster };
 
+  // 詳細は「いま取った」ものなので、一覧の保存日時とは別に取得時刻を返す
+  const at = () => new Date().toISOString();
+
   if (game === "genshin") {
-    const d = await hoyoRequest("genshin", "detail", uid, { character_ids: [entry._id] });
+    const d = await hoyoCached("genshin", "detail", uid, { character_ids: [entry._id] }, String(entry._id));
     const c = (d.list ?? [])[0];
     if (!c) return { found: false, roster };
-    return { found: true, roster, detail: giHoyoDetail(c, d.property_map) };
+    return { found: true, roster, 取得日時: at(), detail: giHoyoDetail(c, d.property_map) };
   }
   if (game === "zzz") {
-    const d = await hoyoRequest("zzz", "detail", uid, { "id_list[]": entry._id, need_wiki: "false" });
+    const d = await hoyoCached("zzz", "detail", uid, { "id_list[]": entry._id, need_wiki: "false" }, String(entry._id));
     const c = (d.avatar_list ?? [])[0];
     if (!c) return { found: false, roster };
-    return { found: true, roster, detail: zzzHoyoDetail(c) };
+    return { found: true, roster, 取得日時: at(), detail: zzzHoyoDetail(c) };
   }
   // スタレは1回のリクエストで全員分（1MB超）返るので、該当キャラだけ取り出す
-  const d = await hoyoRequest("hsr", "detail", uid);
+  const d = await hoyoCached("hsr", "detail", uid);
   const a = (d.avatar_list ?? []).find((x) => x.id === entry._id);
   if (!a) return { found: false, roster };
-  return { found: true, roster, detail: hsrHoyoDetail(a, d.property_info, await hsrRelicSets(DATA_DIR)) };
+  return { found: true, roster, 取得日時: at(), detail: hsrHoyoDetail(a, d.property_info, await hsrRelicSets(DATA_DIR)) };
 }
 
 // ---------- 原神 / ゼンレスゾーンゼロ（Enka.Network） ----------
@@ -816,7 +846,12 @@ server.tool(
           const owned = (r.roster?.キャラ ?? []).map((c) => c.名前).join("、");
           throw new Error(`「${name}」が所持キャラに見つかりません。所持: ${owned || "（取得できず）"}`);
         }
-        return text({ ゲーム: GAME_JA[game], 出典: label, 取得日時: r.roster._fetched_at, ...r.detail });
+        return text({
+          ゲーム: GAME_JA[game], 出典: label,
+          取得日時: r.取得日時,                 // 詳細を取った時刻
+          所持一覧の取得日時: r.roster?._fetched_at, // キャラを引くのに使った一覧の時刻
+          ...r.detail,
+        });
       };
 
       if (source === "hoyolab") return await fromHoyolab("HoYoLAB 戦績");
@@ -875,7 +910,7 @@ server.tool(
   async ({ game, uid, refresh = true, raw = false }) => {
     try {
       const u = resolveGameUid(game, uid);
-      if (raw) return text(await hoyoRequest(game, "basic", u));
+      if (raw) return text(await hoyoCached(game, "basic", u));
       const roster = await getRoster(game, u, { refresh });
       return text({
         ゲーム: GAME_JA[game],
